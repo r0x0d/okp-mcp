@@ -1,11 +1,13 @@
 """SOLR client and query utilities."""
 
 import re
+import time
 
 import httpx
 from rank_bm25 import BM25Plus  # pyright: ignore[reportMissingImports]
 
 from .config import STOP_WORDS, logger
+from .metrics import SOLR_QUERIES, SOLR_QUERY_DURATION
 
 
 def _split_quoted_and_plain(text: str) -> list[str]:
@@ -106,6 +108,7 @@ def _clean_query(query: str) -> str:
 
 async def _solr_query(params: dict, client: httpx.AsyncClient | None = None, *, solr_endpoint: str) -> dict:
     """Execute a SOLR query and return the parsed JSON response."""
+    _start = time.monotonic()
     close_client = client is None
     if client is None:
         client = httpx.AsyncClient(timeout=30.0)
@@ -177,30 +180,38 @@ async def _solr_query(params: dict, client: httpx.AsyncClient | None = None, *, 
         response.raise_for_status()
         data = response.json()
     except httpx.TimeoutException:
-        logger.warning("SOLR query timed out after 30s")
+        SOLR_QUERIES.labels(status="timeout").inc()
+        logger.warning("SOLR query timed out after 30s", exc_info=True)
         raise
     except httpx.HTTPStatusError as e:
-        logger.error("SOLR returned HTTP %d: %s", e.response.status_code, e.response.text[:200])
+        SOLR_QUERIES.labels(status="error").inc()
+        logger.exception("SOLR returned HTTP %d: %s", e.response.status_code, e.response.text[:200])
         raise
     except httpx.RequestError as e:
-        logger.error("SOLR connection error: %s", e)
+        SOLR_QUERIES.labels(status="error").inc()
+        logger.exception("SOLR connection error: %s", e)
         raise
     except ValueError as e:
-        logger.error("SOLR returned non-JSON response: %s", e)
+        SOLR_QUERIES.labels(status="error").inc()
+        logger.exception("SOLR returned non-JSON response: %s", e)
         raise
     finally:
+        SOLR_QUERY_DURATION.observe(time.monotonic() - _start)
         if close_client:
             await client.aclose()
 
     _empty_response = {"response": {"numFound": 0, "docs": []}, "highlighting": {}}
 
     if "error" in data:
+        SOLR_QUERIES.labels(status="error").inc()
         logger.error("SOLR returned error: %s", data["error"])
         return _empty_response
     if "response" not in data or not isinstance(data.get("response", {}).get("docs"), list):
+        SOLR_QUERIES.labels(status="error").inc()
         logger.error("SOLR returned unexpected structure: %s", list(data.keys()))
         return _empty_response
 
+    SOLR_QUERIES.labels(status="success").inc()
     num_found = data["response"]["numFound"]
     num_docs = len(data["response"]["docs"])
     logger.info("SOLR query matched %d total, returning %d docs", num_found, num_docs)
